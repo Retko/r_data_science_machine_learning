@@ -1,0 +1,819 @@
+---
+title: "Energy. EDA, Visualizations, Hypothesis Testing, Regression, Time Series"
+author: "Michael Miscanuk"
+date: "12/14/2020"
+output:
+  html_document: 
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    number_sections: true
+---
+
+# Setup.  
+! Set Directory to the directory with .Rmd file - Set manually if not working in R_Markdown via R Menu - Sessions - Set Working Directory - To Source File Location.
+```{r, message=FALSE, warning=FALSE}
+# setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+# getwd()
+```
+
+## Install Packages.  
+```{r, message=FALSE, warning=FALSE}
+# install.packages("tidyverse")
+# install.packages("psych")
+# install.packages("ggseas")
+# install.packages("seasonal")
+# install.packages("x13binary")
+# install.packages("plotly")
+# install.packages("lmtest")
+```
+
+## Load Libraries.  
+```{r, message=FALSE, results=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(corrplot)
+library(reshape2)
+library(lubridate)
+library(psych)
+library(ggseas)
+library(seasonal)
+library(x13binary)
+library(plotly)
+library(splines)
+library(mgcv)
+library(olsrr)
+library(lmtest)
+library(tseries)
+library(forecast)
+library(data.table)
+```
+
+## Controlling Font Size.  
+This chunk of code is required so we can later control the font size of the R MArkdown Output by using size=small. More info here - https://bit.ly/3oDXZcD 
+```{r, message=FALSE, results=FALSE, warning=FALSE}
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", 
+                                              options$size,"\n\n", 
+                                              x, "\n\n \\normalsize"), x)
+})
+```
+
+## Remove Enviromental Variables.  
+Uncomment as necessary. 
+```{r, message=FALSE, warning=FALSE}
+# rm(list=ls())
+```
+
+## Datasets Description.   
+In this work, I will analyze two datasets. 
+
+First is the Energy Generation Dataset for Czech Republic for timeframe starting from beginning of the year 2020 till the moment I extracted the data (09-12-2020). 
+Dataset was extracted manually from ENTSO-E platform in CSV format.
+The dataset contains values of generated output in MW per hour (rows) for each production type (columns), like nuclear, gas, hydro etc.
+Link - https://bit.ly/3qDwUYO
+   
+Second Dataset is the Imbalance Dataset also downloaded from the same platform for the same country and time period. Each row contains the imbalance data for an hour interval. 
+Link - https://bit.ly/37RljNh
+
+
+## Load Data.   
+```{r, message=FALSE, results=FALSE, warning=FALSE}
+# Loading Actual Generation per Production Type Data, For 2020 (till 09-12-2020)
+generation <- read_csv(".//data//Actual Generation per Production Type_202001010000-202101010000.csv", 
+                       na = "n/e")
+
+imbalance <- read_csv(".//data//Imbalance_202001010000-202101010000.csv", 
+                  na = c("-", "N/A"))
+```
+
+# Exploratory Data Analysis.  
+In this work I will focus exploratory data analysis and Visualizations only on the first dataset - the Generation Type. I will skip this for Imbalance dataset, which will be used in the Regression part.
+
+## Examine Number of Rows, Number of Columns, Column Names, Data Types, and glimpse of Values.
+```{r, size = 'small', warning=FALSE}
+# Glimpse function will show basic column information, like column names, data types and some values together with number of rows and number of columns in a dataset.
+glimpse(generation) 
+```
+
+
+## Getting the Summary Statistics of Data.  
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+# describe() function creates a table with summary statistics for each column. It comes from package psych.
+summary_statistics <- describe(generation)
+```
+In the resulting table with summary statistics we see in column n that 5 columns have 0 numeric values, which means that they contain only NAs. We will remove those columns later.
+
+We can also see that many columns have 541 NA's (8784 of overall number of rows in dataset subtract 8243 of numeric values marked in column n). Those are empty values from 9-12-2020 till the end of a year. I will remove them later also. 
+
+For numerical columns we can examine mean, standard deviation, median, trimmed mean, median absolute deviation from the median or MAD, min, max, range, skew kurtosis and standard error. We can make i quick look if data are in the reasonable ranges.
+
+## Preprocessing - Data Cleaning and Transformations.    
+### Removing Columns that have only NA.                       
+                                              
+These columns should be removed:   
+Fossil Oil shale  - Actual Aggregated [MW]   
+Fossil Peat  - Actual Aggregated [MW]   
+Geothermal  - Actual Aggregated [MW]   
+Marine  - Actual Aggregated [MW]   
+Wind Offshore  - Actual Aggregated [MW]   
+
+We could do it manually, but let's use some code to find out columns that have NA only, and remove those, and then check if required columns were removed.
+```{r, size = 'small', warning=FALSE}
+# Filter is a function which is time and memory efficient;
+# it will go through each column and filter out columns where all values are NA
+generation <- Filter(function(x)!all(is.na(x)), generation)
+
+glimpse(generation)
+```
+
+Using glimpse we see that 5 columns were removed and we also dont see any columns where first values are NAs.
+
+### Removing Future rows with empty values for energy generated.
+These values are placeholders and will be filled in the future, but we dont need them now.
+
+Let's programatically find out which of the rows with numeric data contains only NA and remove tme
+
+First I will findout how many NA values each row has. We see that we have 541 rows that have 16 NAs. And after some examination of csv I know it is the last rows.
+
+
+```{r, message=FALSE, warning=FALSE}
+# Find out how many NA values each row has
+# From this we know that 8243 rows has 0 NAs and 541 has 16 NAs
+rowSums(is.na(generation)) %>% table()
+
+generation <- generation[rowSums(is.na(generation)) != 16,]
+```
+
+
+### Aggregating Data to the Daily Level.
+The MTU column contains the time interval string. We can take a substring from it of the first 10 characters and then make date column from it.
+Then I will use group by a sum all the numeric columns to the upper level of days and remove the MTU column.
+
+In the meantime I will also remove the first column Area, since we know we have data only for CZ.
+```{r, message=FALSE, warning=FALSE}
+generation_aggr <- generation %>% 
+  mutate(date_col = as.Date(substr(generation$MTU, 1, 10), "%d.%m.%Y")) %>%
+  select(c(-MTU, -Area)) %>% 
+  group_by(date_col) %>% 
+  summarise_all(sum)
+```
+
+Let's make a check that we aggregated data correctly.
+```{r, message=FALSE, warning=FALSE}
+# This will make a check that we summarized correctly (last column for one day)
+generation %>%
+  filter(as.Date(substr(generation$MTU, 1, 10), "%d.%m.%Y") == '2020-01-01') %>%
+  select("Wind Onshore  - Actual Aggregated [MW]") %>% sum()
+
+generation_aggr %>%
+  filter(date_col == '2020-01-01') %>%
+  select("Wind Onshore  - Actual Aggregated [MW]") %>% sum()
+```
+
+
+
+
+## Visualizations.  
+### Correlation Plot.  
+This plot shows us which types of energy are correlated.
+
+For Correlation plot we need to shorten the column names. Here I used only first word of the generation type with the number. 
+
+Here is the matching shortened name with previous long name:
+
+"Biomass"  = "Biomass"  - Actual Aggregated [MW]"                        
+"Fossil 1" = "Fossil"	 Brown coal/Lignite  - Actual Aggregated [MW]"      
+"Fossil 2" = "Fossil Coal-derived gas  - Actual Aggregated [MW]"        
+"Fossil 3" = "Fossil Gas  - Actual Aggregated [MW]"                     
+"Fossil 4" = "Fossil Hard coal  - Actual Aggregated [MW]"               
+"Fossil 5" = "Fossil Oil  - Actual Aggregated [MW]"                     
+"Hydro 1"  = "Hydro Pumped Storage  - Actual Aggregated [MW]"           
+"Hydro 2"  = "Hydro Pumped Storage  - Actual Consumption [MW]"          
+"Hydro 3"  = "Hydro Run-of-river and poundage  - Actual Aggregated [MW]"
+"Hydro 4"  = "Hydro Water Reservoir  - Actual Aggregated [MW]"          
+"Nuclear"  = "Nuclear  - Actual Aggregated [MW]"                        
+"Other 1"  = "Nuclear" "Other  - Actual Aggregated [MW]"                          
+"Other 2"  = "Other renewable  - Actual Aggregated [MW]"                
+"Solar"    = "Solar  - Actual Aggregated [MW]"                          
+"Waste"    = "Waste  - Actual Aggregated [MW]"                          
+"Wind" 	   = "Wind Onshore  - Actual Aggregated [MW]"     
+
+```{r, message=FALSE, warning=FALSE}
+# Removing Date Column
+generation_no_date <- generation_aggr %>% select(-date_col)
+
+# Shortening Column Names.
+generation_no_date_shortened_colnames <- generation_no_date
+colnames(generation_no_date_shortened_colnames) <- c("Biomass", "Fossil 1", "Fossil 2", 
+                                                     "Fossil 3","Fossil 4","Fossil 5",
+                                                     "Hydro 1","Hydro 2","Hydro 3",
+                                                     "Hydro 4","Nuclear","Other 1",
+                                                     "Other 2","Solar","Waste","Wind" )
+
+# Correlation Plot
+corrplot(cor(generation_no_date_shortened_colnames), addCoef.col="grey", 
+         order = "AOE", method= 'ellipse',number.cex=0.5 )
+```
+
+Here we can for example see the strong negative correlation between Fossil 1, (which is Fossil - Brown coal/Lignite) and Solar. When generation one goes up, generation of the other other goes down. 
+Surprisingly there are no many strong correlations here and many of them are around 0, which means there is no correlation betweeen generation types. 
+
+### Scatter Plot.  
+Let's take both generation types pointed out in the correlation part above and visualize it on the scatter plot.
+
+Because these generation types have quite different scales we need to Standardize the value (put them on the scale of mean 0 and standard deviation 1) before we can put them on scatterplot. Other possibility would be to use log scale for Fossil.
+
+```{r, message=FALSE, warning=FALSE}
+# Scale all columns and put back to DataFrame
+generation_no_date_shortened_colnames_scaled <- 
+  generation_no_date_shortened_colnames %>%
+  scale() %>% as.data.frame()
+
+# Scatterplot
+fig_scatter <- plot_ly(data = generation_no_date_shortened_colnames_scaled, 
+                       x = ~`Fossil 1`, 
+                       y = ~Solar)
+
+fig_scatter <- fig_scatter %>% layout(title = 'Fossil Coal-derived gas VS Solar (Standardized)',
+                      xaxis = list(title='Fossil Coal-derived gas  - Actual Aggregated [MW]'), 
+                      yaxis = list(title='Solar  - Actual Aggregated [MW]'))
+fig_scatter
+
+### Same by build-in plot() function
+# plot(generation_no_date_shortened_colnames_scaled$"Fossil 1", 
+#   generation_no_date_shortened_colnames_scaled$"Solar", 
+#   main="Fossil Coal-derived gas VS Solar (Standardized)",
+#   xlab="Fossil Coal-derived gas  - Actual Aggregated [MW]", 
+#   ylab="Solar  - Actual Aggregated [MW]", pch=20)
+```
+
+From the Scatterplot we can see that for low values of Fossil we have high values of Solar.
+
+
+### BoxPlot.   
+Here I am using the boxplot to compare the distributions of different generation types.
+
+```{r, message=FALSE, warning=FALSE}
+# Boxplot requires data to be in a long format. Let's use melt() function from reshape2 package.
+ggplot(data = melt(generation_no_date_shortened_colnames), aes(x=variable, y=value)) + 
+  geom_boxplot(aes(fill=variable))+
+  coord_flip() +
+  xlab("Generation (MW)") + 
+  ylab("Generation Type") + 
+  guides(fill=guide_legend(title="Generation Type")) +
+  labs(title = "All Generation Types in CZ")
+```
+From this plot we can see that CZ mostly generate electricity from Nuclear and Fossil Coal.
+But it is hard to compare the other types since they are squished by the prevailing types. Let's take them out and compare other minor types.
+
+```{r, message=FALSE, warning=FALSE}
+# Dropping the major generation types.
+generation_minor_types <- generation_no_date_shortened_colnames %>% 
+  select(c(-"Fossil 1",-"Nuclear"))
+
+# Boxplot of minor generation types.
+ggplot(data = melt(generation_minor_types), aes(x=variable, y=value)) + 
+  geom_boxplot(aes(fill=variable)) +
+  coord_flip() +
+  xlab("Generation (MW)") + 
+  ylab("Generation Type") + 
+  guides(fill=guide_legend(title="Generation Type")) +
+  labs(title = "Minor Generation Types in CZ")
+  
+```
+Looking at this plot we will formulate some hypothesis to test if there a significant difference between some generation types, but before this, let's see one more visualization. 
+
+#### Line Chart - Time Series of the Major Types.
+For this chart I will use again Dataset with the date column. Here I will compare two main generation types that we discovered in boxplots - Fossil Coal and Nuclear. We will see also if there is some trend regarding the pandemic situation in 2020.
+```{r, message=FALSE, warning=FALSE}
+# Shortening Column Names as above, but not removing the date column
+generation_with_date_shortened_colnames <- generation_aggr
+colnames(generation_with_date_shortened_colnames) <- c("date_col", "Biomass", "Fossil 1", 
+                                                       "Fossil 2", "Fossil 3","Fossil 4",
+                                                       "Fossil 5","Hydro 1","Hydro 2",
+                                                       "Hydro 3","Hydro 4","Nuclear",
+                                                       "Other 1","Other 2","Solar",
+                                                       "Waste","Wind" )
+
+# Selecting Date column with 2 major generation types.
+generation_with_date_major_types <- generation_with_date_shortened_colnames %>% 
+  select(c("date_col", "Fossil 1","Nuclear"))
+
+# Time Series Plot. 
+trace_0 <- generation_with_date_major_types$`Fossil 1`
+trace_1 <- generation_with_date_major_types$Nuclear
+
+fig_ts1 <- plot_ly(generation_with_date_major_types, x = ~date_col)
+fig_ts1 <- fig_ts1 %>% add_trace(y = ~trace_0, name = 'Fossil Coal/Lignite',mode = 'lines')
+fig_ts1 <- fig_ts1 %>% add_trace(y = ~trace_1, name = 'Nuclear',mode = 'lines')
+
+fig_ts1 <- fig_ts1 %>% layout(title = 'Two major Generation Types in CZ in 2020', 
+                      xaxis = list(title='Date'), 
+                      yaxis = list(title='Generation (MW)'))
+fig_ts1
+
+### Time Series Plot - Same in ggplot()
+## function pivot_longer() is similar to melt() making the narrow table, required for ggplot line chart
+# generation_with_date_major_types_long <- pivot_longer(generation_with_date_major_types, cols=2:3, names_to = "variable", values_to = "value")
+
+## ggplot()
+# ggplot(generation_with_date_major_types_long,
+#        aes(x=date_col,y=value,colour=variable,group=variable)) + 
+#   geom_line() +
+#   xlab("Date") + 
+#   ylab("Generation (MW)") + 
+#   guides(color=guide_legend(title="Generation Type")) +
+#   labs(title = "Two major Generation Types in CZ in 2020")
+```
+From this chart we can see that there might have been some effect of the pandemic situation in the 2020 when few people were working - there is a decline in Fossil Coal Energy type in April 2020. This decline was probably replaced by increased generation of Nuclear energy.
+
+There are more visualization below that belong to individual tasks.
+
+
+# Hypothesis Tests.  
+## T-Test - One-Sample.  
+Look back at the boxplot of minor generation types in the graph above. It looks like Fossil 3 (Fossil Gas) has quite wide distribution. Here is the histogram.
+
+```{r, message=FALSE, warning=FALSE}
+fig <- plot_ly(x = generation_minor_types$"Fossil 3", type = "histogram")
+fig <- fig %>% layout(title = 'Fossil 3 Generation Type', 
+                      xaxis = list(title='Fossil 3'), 
+                      yaxis = list(title='Generation (MW)'))
+fig
+
+## Same with build-in hist() function
+# hist(generation_minor_types$"Fossil 3")
+```
+
+Let's look at the mean.  
+We will call it our population - The data of Fossil Gas generated during 2020.
+```{r, message=FALSE, warning=FALSE}
+mean(generation_minor_types$"Fossil 3")
+```
+
+Now let's make a little simulation. We will take a sample of several values - this will simulate taking the measurement sporadically and taking the mean. We can the hypothesize is mean is below or above some value.
+```{r, message=FALSE, warning=FALSE}
+set.seed(6)
+
+n = 25
+fossil_3_sample = sample(generation_minor_types$"Fossil 3", n, replace = FALSE)
+
+mean(fossil_3_sample)
+```
+
+Now let's assume we don't know the population mean (14598,41). Let's test from the sample mean (15734.68), by inferring from it to the population mean, and test whether the the population mean can be 14500 MW.
+
+H0 = True Mean is 14500 MW
+H1 = True Mean is not 14500 MW
+```{r, message=FALSE, warning=FALSE}
+t.test(fossil_3_sample, mu = 14500, alternative='two.sided', conf.level = 0.95)
+```
+p-value is equal 0.3933 therefore we could not reject H0, and we cannot say that true mean is not 14500 MW.
+
+## T-Test - two-sample comparison — A/B test.  
+
+Often we can tell only by the look of it, that the distributions are really different and therefore the means are different, for example 'Wind' on first place in boxplot above and the last one 'Biomass' has really different distributions, so we dont have to make any tests to find out if the means in the populations are significantly different, it is quite obvious that they are different.  
+   
+
+But some distributions overlap, for example 'Hydro 4' (Hydro Water Reservoir) and 'Fossil 4' (Fossil Hard coal). From the look of it, we might tell that the means are different in the population (which in this case can be all years), but this difference might as well have happened by chance. Let's use the two-sample t-test to find out if the difference is statistically significant on 0.05 significance level (or 0.95 confidence level).
+
+```{r, message=FALSE, warning=FALSE}
+### First we need long dataframe, containing only our required generation types, so let's filter them.
+# Selecting Date column with Minor generation types.
+generation_with_date_similar_types <- generation_with_date_shortened_colnames %>%
+  select(c("date_col", "Fossil 4", "Hydro 4"))
+
+# function pivot_longer() is similar to melt() making the narrow (long) table format, required for t-test.
+generation_with_date_similar_types_long <- 
+  pivot_longer(generation_with_date_similar_types, cols=2:3, 
+               names_to = "variable", values_to = "value")
+
+### Two-Sample T-Test
+# H0: both generation types are the same
+# H1: both generation types are NOT the same (difference is not 0)
+t.test ( value ~ variable , data=generation_with_date_similar_types_long , 
+         alternative= 'two.sided', conf.level = 0.95 )
+```
+P-Value is really small suggesting that we can reject H0 and say that both groups (generation types) are different.
+
+# Regression.  
+## Join Datasets - Generation Type with Imbalance.
+
+In regression I want to analyze how Imbalance level depends on two major Generation Types. Before the regression I will need to join both datasets on the day key. And before that we also need to do some cleanup.
+```{r, message=FALSE, warning=FALSE}
+# Check NAs. 553 rows has NA in all 7 columns
+rowSums(is.na(imbalance)) %>% table()
+
+# Remove all rows where there is 7 NAs
+imbalance2 <- imbalance[rowSums(is.na(imbalance)) != 7,]
+
+# Select required Columns
+imbalance_reduced <- imbalance2 %>% select(c("Imbalance settlement period (UTC)", 
+                                            "Total Imbalance [MWh] - MBA|CZ"))
+# Rename columns
+colnames(imbalance_reduced) <- c("datetime_interval", "Imbalance_MWH")
+
+# Check NAs again. 0 NAs contain 8231 rows (all rows)
+rowSums(is.na(imbalance_reduced)) %>% table()
+
+# Aggregate on Daily Level.
+imbalance_reduced_aggr <- imbalance_reduced %>% 
+  mutate(date_col = as.Date(substr(imbalance_reduced$datetime_interval, 1, 10), "%d.%m.%Y")) %>%
+  select(c(-datetime_interval)) %>% 
+  group_by(date_col) %>% 
+  summarise_all(sum)
+
+# check that we aggregated data correctly.
+imbalance_reduced %>%
+  filter(as.Date(substr(imbalance_reduced$datetime_interval, 1, 10), "%d.%m.%Y") == '2020-01-01') %>%
+  select("Imbalance_MWH") %>% sum()
+# 2762
+
+imbalance_reduced_aggr %>%
+  filter(date_col == '2020-01-01') %>%
+  select("Imbalance_MWH") %>% sum()
+# 2762
+
+# I will use the generation table with both major types and join the imbalance data to it, on the date_col key (specified by default because column names are the same)
+generation_imbalance <- merge(generation_with_date_major_types, imbalance_reduced_aggr)
+```
+
+## Initial Model.  
+```{r, message=FALSE, warning=FALSE}
+reg = lm(`Imbalance_MWH`~`date_col`+`Fossil 1`+`Nuclear`, data=generation_imbalance)
+summary(reg)
+```
+First of all we should look at the F-statistic. It seems that it is significant, and model makes sense. We then proceed to p-values for the coefficients, where it also seems to be significant for all X variables together with the intercept. But looking at the Adjusted R-squared, it doesn't seem very good. It looks like out model explained only 7% of the variability is the Y variable, which is close to terrible. Let's check the regression assumptions and see if we can use some other regression type (not linear) to make it better.
+
+## Check Multicollinearity.   
+Here we check that our 3 Predictor variables are not correlated. 
+```{r, message=FALSE, warning=FALSE}
+# Correlation Plot
+corrplot(cor(generation_imbalance[c("Fossil 1","Nuclear","Imbalance_MWH")]), 
+         addCoef.col="grey", 
+         order = "AOE", 
+         method= 'ellipse',
+         number.cex=0.5 )
+```
+Correlations are around 0, so ] we can use all 3 variables in our model.
+
+### Removing Outliers and Checking the Model again.
+Now let's check for the outliers, since those can cause problems in regression model. I will use Plot of residuals for it and since choosing outliers is somewhat subjective, and we know that outliers should be randomly scattered on the residuals plot, I will choose a line of 1000 MWH of Imbalance on residuals plot, and remove everything above it.
+```{r, message=FALSE, warning=FALSE}
+# In Residuals plot we can see quite a few of outliers (points should be randomly scattered around the chart). 
+plot(reg$residuals)
+
+# Which observations has residuals above 1000?
+which(generation_imbalance$Imbalance_MWH > 1700)
+
+# Remove Outliers
+generation_imbalance_no_outliers <- generation_imbalance[-c(1,2,22,24,32,33,41,46,58,61,62,68,72,73,74,75,78,80,82,86,87,88,89,90,95,101,104,122,126,127,129,130,131,132,135,136,144,145,149,156,161,174,187,189,271,272,299,304,307,315,331,337,338), ]
+
+# Model
+reg2 = lm(`Imbalance_MWH`~`date_col`+`Fossil 1`+`Nuclear`, data=generation_imbalance_no_outliers)
+summary(reg2)
+```
+From the output we now see that date column is not significant anymore, so we can remove it from the model. 
+
+### Removing the Date Columns and Checking the Model again.
+```{r, message=FALSE, warning=FALSE}
+# Removing Date Column
+generation_imbalance_no_outliers_no_date <- 
+  generation_imbalance_no_outliers %>% select(c("Fossil 1","Nuclear","Imbalance_MWH"))
+
+  
+colnames(generation_imbalance_no_outliers_no_date) <- c("Fossil_1","Nuclear","Imbalance_MWH")
+
+# Model
+reg3 = lm(`Imbalance_MWH`~`Fossil_1`+`Nuclear`, data=generation_imbalance_no_outliers_no_date)
+summary(reg3)
+```
+We still have very low R Adjusted. Let's visualize the in 3D to see if we can use some non-linear model type. (Note that this is possible when having up to two X variables)
+
+## Visualizing in 3D Scatterplot.  
+```{r, warning=FALSE}
+plot_ly(x=generation_imbalance_no_outliers_no_date$`Fossil_1`, y=generation_imbalance_no_outliers_no_date$Nuclear, z=generation_imbalance_no_outliers_no_date$Imbalance_MWH, type="scatter3d", mode="markers")
+```
+From the plot we see that the Nuclear type has 4 to 5 clusters where values come together. Let's try Spline Regression and GAM Regression in the next section to see if it will improve the R^2 Adjusted.
+
+
+## Spline Regression and GAM Regression.  
+Spline regression will use knots that sepaparate the variable to several sections and fit the linear model in each section (having continuous change on the knots). GAM will find the best number of knots.
+I skipped the output but put the R^2 Adjusted in the comments.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, results=FALSE}
+# For Spline Regression I specified 3 knots (4 sections) manually from the look at the plot.
+knots = c(62000, 77000, 87000)
+
+lm_spline <- lm ( Imbalance_MWH ~ bs ( Nuclear , knots=knots , degree=3 ) +
+  Fossil_1 , data=generation_imbalance_no_outliers_no_date )
+
+summary(lm_spline) # Adjusted R-squared:  0.1121
+
+lm_gam <- gam ( Imbalance_MWH ~ s(Nuclear) + Fossil_1, 
+                data=generation_imbalance_no_outliers_no_date )
+summary(lm_gam) # R-sq.(adj) =  0.111
+```
+Seems that we have improvement using 3 knots in spline regression. I will use it further and check other model assumptions on it.
+
+## Removing Influential Observations.  
+Some values in the dataset are not outliers but has big influence on the regression model, those should be removed (or examined further). Let's find out which they are and remove them,  I will use Cook's Distance for it. 
+```{r message=FALSE, warning=FALSE, include=FALSE, results=FALSE}
+par(mfrow=c(2,2))
+plot(lm_spline) 
+
+generation_imbalance_no_influential <- 
+  generation_imbalance_no_outliers_no_date[-c(119, 121, 222), ]
+
+lm_spline2 <- lm ( Imbalance_MWH ~ bs ( Nuclear , knots=knots , degree=3 ) +
+  Fossil_1 , data=generation_imbalance_no_influential )
+
+summary(lm_spline2) # Adjusted R-squared:  0.1107
+```
+On the last plot - Residual VS Leverage we see several influential values. Removing those and fitting the model again we don't see much improvement in Adjusted R-squared.
+
+
+## Residual Diagnosis.  
+Using Plot function on the model itself will provide us several plots that we can use to analyze residuals.  
+```{r, message=FALSE, warning=FALSE}
+plot.new() # signals to R that a new plot is to be produced; to reset previous plot()
+par(mfrow=c(2,2))
+plot(lm_spline2)
+```
+Residuals vs Fitted plot shows minor heteroskedasticity - changing variability.  
+Normal Q-Q Plot shows that we don't have a normally distributed residuals, we will confirm it in a second.  
+
+## Heteroskedasticity.  
+Here I will test for the heteroskedasticity in the data using some of the statistical tests, in this case the Breusch-Pagan test.
+```{r, message=FALSE, warning=FALSE}
+bptest(lm_spline2)
+```
+P-Value is > 0.05, therefore we cannot reject the H0, so we say that residuals have constant variance. If we would have the variance in the residuals, we could have used the weighted regression to solve this, giving more weight to the X values where residuals have smaller variance.
+
+
+## Normally Distributed Residuals.  
+```{r, message=FALSE, warning=FALSE}
+shapiro.test(lm_spline2$residuals)
+```
+In this test we actually want  to accept H0 for the residuals to be normally distributed. By the result we see that p-value is small, and by rejecting H0 we therefore confirm that residuals are not normally distributed. This points out that the used model is not correct and we would probably be better of using something totally different, like Regression Trees or even Neural Networks. But I will not proceed in this direction in this work.
+
+## Autocorelation in Residuals.  
+Durbin-Watson test will tell us if we have autocorrelation in the data. And since the the underlying data are taken in time, we would expect it to have autocorrelation. 
+```{r, message=FALSE, warning=FALSE}
+dwtest(lm_spline2)
+```
+Value of Durbin Watson that we received is 1.78. Those values are interpreted like this:  
+  
+2 is no autocorrelation.
+0 to <2 is positive autocorrelation (common in time series data).
+>2 to 4 is negative autocorrelation (less common in time series data).
+  
+From this we can confirm that thare is some lag involved.
+
+
+## Partial Residuals Plots.  
+Partial Residuals Plot is a good way to visualize the contribution  of some predictor variable to the response variable (here Imbalance). On X axis are the numbers of the predictor (Fossil in MW) and on Y axis are the residuals. We also see the regression curve (and off course we would like the partial residuals to be as closer as possible to the regression curve)
+
+### Relationship between Fossil_1 and Imbalance.  
+We see that the residuals are scattered all around and there is not much os a relationship or we have really minor downward slope. This is one of the reasons that Adjusted R-Squared was that small, because X variable didn't explain much of the movement of Imbalance.
+```{r, message=FALSE, warning=FALSE}
+terms <- predict(lm_spline2, type='terms')
+partial_resid <- resid(lm_spline2) + terms
+
+df <- data.frame(Fossil_1 = generation_imbalance_no_influential[, 'Fossil_1'],
+                 Terms = terms[, 'Fossil_1'],
+                 PartialResid = partial_resid[, 'Fossil_1'])
+graph <- ggplot(df, aes(Fossil_1, PartialResid)) +
+  geom_point(shape=1) + scale_shape(solid = FALSE) +
+  geom_smooth(linetype=2) +
+  geom_line(aes(Fossil_1, Terms)) +
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE))
+graph
+```
+
+### Relationship between Nuclear and Imbalance. 
+As we saw above we have 4 to 5 clusters in numbers of Nuclear energy. Imbalance for each cluster is moving unpredictably up and down for each cluster. This also accounts to the low Adjusted R-Squared. As can be seen on the plot below, by using the splines we could use different values of imbalance for each cluster of Nuclear and make our prediction cluster this way, but since the variability of imbalance is such a big for each cluster, it is not ver helpful.  
+```{r, message=FALSE, warning=FALSE}
+terms <- predict(lm_spline2, type='terms')
+partial_resid <- resid(lm_spline2) + terms
+
+df <- data.frame(Nuclear = generation_imbalance_no_influential[, 'Nuclear'],
+                 Terms = terms[, 1], # on first place is the splines column for 'Nuclear'
+                 PartialResid = partial_resid[, 1]) # on first place is the splines column for 'Nuclear'
+
+graph <- ggplot(df, aes(Nuclear, PartialResid)) +
+  geom_point(shape=1) + scale_shape(solid = FALSE) +
+  geom_smooth(linetype=2) +
+  geom_line(aes(Nuclear, Terms)) +
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE))
+graph
+```
+
+## Final word on Regression.  
+Based on very small value of Adjusted R-squared I cannot say that I found good regression model for this task to predict imbalance only from the values of major generation types. In the next section I will put back the date variable and try out the methods of Time Series and see if will be better of with the predictions.
+
+
+
+# Time Series.  
+In the time series analysis I will look at the one of the major generation types in CZ - Fossil Brown Coal/Lignite. We already saw the plot, where we could see the drastic drop in the middle of the year. Here we will find out more about the seasonal component of the series and develop several models, then choose the best one and it them to make predictions. We will also examine the chosen model using the residual diagnosis.
+
+## Removing of the last 10 days in the dataset. (Creating Test Set).  
+Last 10 observation will be used in the end to compare our best chosen model to the reality. Full Dataset with last 10 observations can be considered as a Test Set. 
+```{r, message=FALSE, warning=FALSE}
+# Store full time series
+ts_fossil1_full <- ts(generation_with_date_major_types$`Fossil 1`)
+
+# Number of observations
+length(ts_fossil1_full) # 344
+
+# Reduce last 10 observations
+ts_fossil1_reduced <- as.ts(as.zoo(ts_fossil1_full)[-(335:344)])
+
+# Number of observations after reduction.
+length(ts_fossil1_reduced) # 334
+```
+
+## Time Series Decomposition on Seasonal and Trend Components.  
+In the plot of Fossil_1 above we can see that seasonal variance is big on both ends (start and end of the year) and smaller in the middle of the year. This suggests that we have multiplicative decomposition. Let's examine the components using plot().
+
+To be able to decompose the time series we need to correctly specify the frequency of the series. Since I am not sure what is the frequency, I will use the function that R provides to find it for me. Knowing the frequency I will rebuild the Time Series object and then do the decomposition.
+
+```{r, message=FALSE, warning=FALSE} 
+# Finding Frequency
+findfrequency(ts_fossil1_reduced) #7
+
+# Rebuilding the TS Object
+ts_fossil1_reduced2 <- ts(ts_fossil1_reduced, frequency = 7)
+
+# Decomposition
+ts_fossil1_reduced_Dec <- decompose(ts_fossil1_reduced2,type = "multiplicative")
+
+# Plot the Components
+plot(ts_fossil1_reduced_Dec)
+```
+  
+After finding the frequency and examining the Dataframe with dates it is obvious that generation is reduced on the weekends. In the plot we confirm that trend is lowest in the middle of the year and steadily moving up in the end. In the random components I dont see any pattern. 
+
+## Training Set and Validation Set. 
+Here I split the Dataset into two parts. I will then train each model on the training set, evaluate it on the Validation Set and choose best model which will give me the highest accuracy on the Validation Set. Chosen ratio is approximately 80/20.  
+
+```{r, message=FALSE, warning=FALSE}
+my_training_set_fossil1 <- window(ts_fossil1_reduced2, end=37 ) # 37 weeks
+
+my_valid_set_fossil1 <- window(ts_fossil1_reduced2, start=38 ) # from 38 week further
+
+# Store length of the Test Set, used later in forecasts as a parameter.
+h <- length (my_valid_set_fossil1)
+```
+
+## Training Models on Training Set.  
+Models that I will train comes in two categories:  
+Benchmark Models - the simplest:  
+Meanf - will predict as a mean of the series.  
+Naive - will predict as a last observation.  
+Drift - variation of naive, that will allow a decrease over time.  
+
+Advanced Models:
+ETS - Exponential Smoothing Model. 
+ARIMA - Models Describing Autocorrelations.
+TBATS - combine several features of time series, like Trigonometric seasonality, Box-Cox
+transformation, ARMA errors, Trend and Seasonal components.
+NNAR - Neural Network Model. 
+Combination - Averaging predictions of other models, can be computed after we make forecasts by other models.
+
+For ARIMA - we are going to use automatic model selection with some parameters - stepwise/approximation = F - slow, but goes over all models and won't approximate - since we have small dataset it is good enough. trace = F - here we dont want to see considered models, just store the best chosen. 
+
+```{r, message=FALSE, warning=FALSE}
+### Benchmarks Models
+meanm <- meanf (my_training_set_fossil1, h=h)
+naivem <- naive (my_training_set_fossil1, h=h)
+driftm <- rwf (my_training_set_fossil1, h=h, drift = T)
+
+### Advanced Models
+my_ets <- ets (my_training_set_fossil1)
+my_arima <- auto.arima (my_training_set_fossil1, trace = F, stepwise = F, approximation = F)
+my_tbats <- tbats (my_training_set_fossil1, biasadj=TRUE )
+my_nnar <- nnetar (my_training_set_fossil1, repeats = 30 )
+```
+
+## Forecasting.  
+```{r, message=FALSE, warning=FALSE}
+meanm_fr <- forecast (meanm, h=h)
+naivem_fr <- forecast (naivem, h=h)
+driftm_fr <- forecast (driftm, h=h)
+
+my_ets_fr <- forecast (my_ets, h=h)
+my_arima_fr <- forecast (my_arima, h=h)
+my_tbats_fr <- forecast (my_tbats, h=h)
+my_nnar_fr <- forecast (my_nnar, h=h)
+```
+
+## Combination of Model Forecasts.  
+For the Combination I will use only advanced models, leaving out the benchmark models.
+```{r, message=FALSE, warning=FALSE}
+my_combination_fr <- (my_ets_fr[[ "mean" ]] + 
+                        my_arima_fr[[ "mean" ]] + 
+                        my_tbats_fr[[ "mean" ]] + 
+                        my_nnar_fr[[ "mean" ]]
+                      ) / 4
+```
+
+## Computing Accuracy of the Forecasts.  
+Here we compare the validation set with the forecasts.  
+```{r, message=FALSE, warning=FALSE}
+meanm_model_accuracy <- as.data.frame ( accuracy (meanm, my_valid_set_fossil1))
+naivem_model_accuracy <- as.data.frame ( accuracy (naivem, my_valid_set_fossil1))
+driftm_model_accuracy <- as.data.frame ( accuracy (driftm, my_valid_set_fossil1))
+
+ets_model_accuracy <- as.data.frame ( accuracy (my_ets_fr, my_valid_set_fossil1))
+arima_model_accuracy <- as.data.frame ( accuracy (my_arima_fr, my_valid_set_fossil1))
+tbats_model_accuracy <- as.data.frame ( accuracy (my_tbats_fr, my_valid_set_fossil1))
+nnar_model_accuracy <- as.data.frame ( accuracy (my_nnar_fr, my_valid_set_fossil1))
+combination_model_accuracy <- as.data.frame ( accuracy (my_combination_fr, my_valid_set_fossil1))
+```
+
+## Table Comparing Accuracy Measures of different models.  
+```{r, message=FALSE, warning=FALSE}
+all_models <- c('meanm_model_accuracy', 'naivem_model_accuracy', 'driftm_model_accuracy',
+                'ets_model_accuracy', 'arima_model_accuracy', 'tbats_model_accuracy',
+                'nnar_model_accuracy', 'combination_model_accuracy')
+accuracy_list <- list()
+
+for( i in all_models){
+  prep_acc <- setDT(get(i)["Test set",], keep.rownames = TRUE)[] 
+  prep_acc$rn[prep_acc$rn=='Test set'] <- i
+  accuracy_list <- c(accuracy_list, list(prep_acc))
+}
+
+# All Cost Functions
+accuracy_df_full <- rbindlist(accuracy_list, fill = TRUE)
+
+# Only RMSE
+accuracy_df_rmse <- accuracy_df_full %>% select(c(1,3)) %>% arrange(RMSE)
+accuracy_df_rmse
+```
+In the resulting table we can see that Naive Model gives the lowest RMSE on the Validation Set, but this is our benchmark model using last value as a forecast of the next value. This model will not take other components into consideration, like seasonality, so it might not be viable in more prediction horizons. Therefore let's take the next best model - tbats - and do the residual diagnostics with it. 
+
+## Residual Diagnostics.  
+```{r, message=FALSE, warning=FALSE}
+checkresiduals (my_tbats)
+```
+Residuals of TBATS model is in accordance with requirements.  
+Residuals are normally distributed.  
+Autocorrelation with lagged residuals is not signifficant; they fluctuate around mean 0 and the variance seems to be constant. It means that model is acceptable.
+
+## Plotting Models to compare to the Test Set.
+Here let's plot all the forecasts at once to compare it to the real data - 10 days ahead not used to train or validate the models. First we need to retrain all the models on our "reduced" dataset where we took out 10 days. Then we will plot it together with the full dataset. 
+Please note, that we could have used only one model here to compare to actual data - the one that had the best accuracy - TBATS!!! But I want to see it visually with other models also in one plot.
+```{r, message=FALSE, warning=FALSE}
+# Train Models
+h2 = 10 # because we took out 10 days.
+
+meanm2 <- meanf (ts_fossil1_reduced, h=h2)
+naivem2 <- naive (ts_fossil1_reduced, h=h2)
+driftm2 <- rwf (ts_fossil1_reduced, h=h2, drift = T)
+my_ets2 <- ets (ts_fossil1_reduced)
+my_arima2 <- auto.arima (ts_fossil1_reduced, trace = F, stepwise = F, approximation = F)
+my_tbats2 <- tbats (ts_fossil1_reduced, biasadj=TRUE )
+my_nnar2 <- nnetar (ts_fossil1_reduced, repeats = 30 )
+
+# Forecast
+meanm_fr2 <- forecast (meanm2, h=h2)
+naivem_fr2 <- forecast (naivem2, h=h2)
+driftm_fr2 <- forecast (driftm2, h=h2)
+my_ets_fr2 <- forecast (my_ets2, h=h2)
+my_arima_fr2 <- forecast (my_arima2, h=h2)
+my_tbats_fr2 <- forecast (my_tbats2, h=h2)
+my_nnar_fr2 <- forecast (my_nnar2, h=h)
+
+# Combination
+my_combination_fr2 <- (my_ets_fr2[[ "mean" ]] + 
+                         my_arima_fr2[[ "mean" ]] + 
+                         my_tbats_fr2[[ "mean" ]] + 
+                         my_nnar_fr2[[ "mean" ]]
+                       ) / 4
+
+autoplot(ts_fossil1_reduced) +
+  autolayer(meanm_fr2, series="Mean", PI=FALSE) +
+  autolayer(naivem_fr2, series="Naive", PI=FALSE) +
+  autolayer(driftm_fr2, series="Drift", PI=FALSE) +
+  autolayer(my_ets_fr2, series="ETS", PI=FALSE) +
+  autolayer(my_arima_fr2, series="ARIMA", PI=FALSE) +
+  autolayer(my_tbats_fr2, series="TBATS", PI=FALSE) +
+  autolayer(my_nnar_fr2, series="NNAR", PI=FALSE) +
+  autolayer(my_combination_fr2, series="Combination") +
+  autolayer(ts_fossil1_full, series="Full Dataset") +
+  ggtitle("Forecasting Fossil_1") + 
+  xlab("Days") + ylab("Generation (MW)")  +
+  coord_cartesian(xlim = c(320, 350)) +
+  guides(colour=guide_legend(title="Forecast"))
+```
+## Final word on Time Series.  
+From the chart above we can see that even TBATS didn't make good job predicting the series. From the chart we can also see that the most similar movement of the series to the real series gave the Neural Network Model!
+
+The further we predict to the future, the less accurate our forecasts are, and better approach would be to predict on lower horizon and next period to retrain the model again.   
+Another approach to get the best model would be to use Expanding Window Strategy. Imagine that we choose some model from the start of the year, then we retrain it each day, and each day we compare it to the reality, and at the end we would have some amount of error. We then do the same for each model, compare models and choose the one which give us the lowest error.
