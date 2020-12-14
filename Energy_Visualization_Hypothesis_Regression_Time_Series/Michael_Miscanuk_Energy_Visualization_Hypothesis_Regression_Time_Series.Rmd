@@ -812,6 +812,7 @@ autoplot(ts_fossil1_reduced) +
   coord_cartesian(xlim = c(320, 350)) +
   guides(colour=guide_legend(title="Forecast"))
 ```
+  
 ## Final word on Time Series.  
 From the chart above we can see that even TBATS didn't make good job predicting the series. From the chart we can also see that the most similar movement of the series to the real series gave the Neural Network Model!
 
